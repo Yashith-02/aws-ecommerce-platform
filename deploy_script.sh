@@ -292,3 +292,189 @@ setup_monitoring() {
     
     # Subscribe email to SNS topic (replace with your email)
     # aws sns subscribe \
+    #     --topic-arn $TOPIC_ARN \
+    #     --protocol email \
+    #     --notification-endpoint your-email@example.com \
+    #     --region $AWS_REGION
+    
+    # Create CloudWatch dashboard
+    aws cloudwatch put-dashboard \
+        --dashboard-name "${PROJECT_NAME}-dashboard" \
+        --dashboard-body '{
+            "widgets": [
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 0,
+                    "width": 12,
+                    "height": 6,
+                    "properties": {
+                        "metrics": [
+                            ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "'$ALB_DNS_NAME'"],
+                            [".", "TargetResponseTime", ".", "."]
+                        ],
+                        "period": 300,
+                        "stat": "Average",
+                        "region": "'$AWS_REGION'",
+                        "title": "Load Balancer Metrics"
+                    }
+                },
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 6,
+                    "width": 12,
+                    "height": 6,
+                    "properties": {
+                        "metrics": [
+                            ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "'$ASG_NAME'"]
+                        ],
+                        "period": 300,
+                        "stat": "Average",
+                        "region": "'$AWS_REGION'",
+                        "title": "EC2 CPU Utilization"
+                    }
+                }
+            ]
+        }' \
+        --region $AWS_REGION
+    
+    log "Monitoring and alarms configured successfully"
+}
+
+# Validate deployment
+validate_deployment() {
+    log "Validating deployment..."
+    
+    # Wait for load balancer to be ready
+    info "Waiting for load balancer to be ready..."
+    sleep 60
+    
+    # Test health check endpoint
+    if curl -f "http://$ALB_DNS_NAME/health" > /dev/null 2>&1; then
+        log "Health check passed"
+    else
+        warn "Health check failed - application may still be starting"
+    fi
+    
+    # Test main application endpoint
+    if curl -f "http://$ALB_DNS_NAME" > /dev/null 2>&1; then
+        log "Application is responding"
+    else
+        warn "Application endpoint not responding"
+    fi
+    
+    log "Deployment validation completed"
+}
+
+# Cleanup function
+cleanup() {
+    log "Cleaning up temporary files..."
+    rm -f tfplan
+}
+
+# Main deployment function
+main() {
+    log "Starting AWS E-Commerce Platform deployment..."
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --skip-build)
+                SKIP_BUILD=true
+                shift
+                ;;
+            --destroy)
+                DESTROY=true
+                shift
+                ;;
+            --plan-only)
+                PLAN_ONLY=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                ;;
+        esac
+    done
+    
+    # Handle destroy option
+    if [[ "$DESTROY" == "true" ]]; then
+        warn "DESTROYING infrastructure..."
+        read -p "Are you sure you want to destroy all resources? (yes/no): " -r
+        if [[ $REPLY == "yes" ]]; then
+            cd "$TERRAFORM_DIR"
+            terraform destroy -auto-approve
+            cd - > /dev/null
+            log "Infrastructure destroyed successfully"
+        else
+            info "Destroy cancelled"
+        fi
+        exit 0
+    fi
+    
+    # Set trap for cleanup
+    trap cleanup EXIT
+    
+    # Execute deployment steps
+    check_prerequisites
+    init_terraform
+    plan_terraform
+    
+    # If plan-only, exit here
+    if [[ "$PLAN_ONLY" == "true" ]]; then
+        log "Plan completed. Review the plan above."
+        exit 0
+    fi
+    
+    # Confirm deployment
+    info "Review the Terraform plan above."
+    read -p "Do you want to proceed with deployment? (yes/no): " -r
+    if [[ $REPLY != "yes" ]]; then
+        info "Deployment cancelled"
+        exit 0
+    fi
+    
+    apply_terraform
+    
+    if [[ "$SKIP_BUILD" != "true" ]]; then
+        create_ecr_repo
+        build_and_push_image
+        deploy_application
+    fi
+    
+    setup_monitoring
+    validate_deployment
+    
+    log "Deployment completed successfully!"
+    info "Application URL: http://$ALB_DNS_NAME"
+    info "CloudWatch Dashboard: https://console.aws.amazon.com/cloudwatch/home?region=$AWS_REGION#dashboards:name=${PROJECT_NAME}-dashboard"
+}
+
+# Help function
+show_help() {
+    echo "AWS E-Commerce Platform Deployment Script"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --skip-build    Skip Docker build and deployment steps"
+    echo "  --destroy       Destroy all infrastructure"
+    echo "  --plan-only     Only run terraform plan"
+    echo "  -h, --help      Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                    # Full deployment"
+    echo "  $0 --plan-only        # Plan only"
+    echo "  $0 --skip-build       # Deploy infrastructure only"
+    echo "  $0 --destroy          # Destroy infrastructure"
+}
+
+# Handle help option
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+# Run main function
+main "$@"
